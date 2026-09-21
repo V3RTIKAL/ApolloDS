@@ -103,6 +103,28 @@ TEST(SunshineVirtualDisplay, StableVirtualDisplayUuidDerivesNonCanonicalClientId
   EXPECT_NE(VDISPLAY::client_uuid_to_virtual_display_id(first_guid), 0u);
 }
 
+TEST(SunshineVirtualDisplay, SecondaryIdentityIsStableDistinctAndPerClient) {
+  const std::string client_uuid = "1d6f6f2a-4f29-41b2-958f-6f01d7583f4b";
+  const auto secondary = VDISPLAY::secondaryVirtualDisplayUuidFromStableId(client_uuid);
+  EXPECT_EQ(secondary, VDISPLAY::secondaryVirtualDisplayUuidFromStableId(client_uuid));
+  EXPECT_NE(secondary, VDISPLAY::virtualDisplayUuidFromStableId(client_uuid));
+  EXPECT_NE(
+    secondary,
+    VDISPLAY::secondaryVirtualDisplayUuidFromStableId("9528c3cc-0ec0-477a-9b7a-79450b812d60")
+  );
+}
+
+TEST(SunshineVirtualDisplay, SecondaryLeaseMatchesOnlyItsOwnedGuid) {
+  const auto lease = VDISPLAY::secondaryVirtualDisplayGuid("paired-client");
+  const auto same = VDISPLAY::secondaryVirtualDisplayGuid("paired-client");
+  const auto other = VDISPLAY::secondaryVirtualDisplayGuid("other-client");
+  const auto primary = VDISPLAY::sharedVirtualDisplayGuid();
+
+  EXPECT_TRUE(VDISPLAY::secondaryVirtualDisplayLeaseOwns(lease, same));
+  EXPECT_FALSE(VDISPLAY::secondaryVirtualDisplayLeaseOwns(lease, other));
+  EXPECT_FALSE(VDISPLAY::secondaryVirtualDisplayLeaseOwns(lease, primary));
+}
+
 TEST(SunshineVirtualDisplay, PersistentIdentityUsesTheReservedEnsureStableId) {
   const auto persistent = VDISPLAY::persistentVirtualDisplayUuid();
   EXPECT_EQ(

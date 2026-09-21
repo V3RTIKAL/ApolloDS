@@ -174,6 +174,25 @@ namespace VDISPLAY {
     return uuid;
   }
 
+  uuid_util::uuid_t secondaryVirtualDisplayUuidFromStableId(const std::string_view client_stable_id) {
+    // Keep the identity deterministic across reconnects while domain-separating
+    // it from the primary display's direct client identity.
+    return virtualDisplayUuidFromStableId(
+      "apollo-secondary-display:" + std::string {client_stable_id}
+    );
+  }
+
+  GUID secondaryVirtualDisplayGuid(const std::string_view client_stable_id) {
+    const auto uuid = secondaryVirtualDisplayUuidFromStableId(client_stable_id);
+    GUID guid {};
+    std::memcpy(&guid, uuid.b8, sizeof(guid));
+    return guid;
+  }
+
+  bool secondaryVirtualDisplayLeaseOwns(const GUID &lease_guid, const GUID &candidate_guid) {
+    return std::memcmp(&lease_guid, &candidate_guid, sizeof(GUID)) == 0;
+  }
+
   uuid_util::uuid_t persistentVirtualDisplayUuid() {
     // The shared encoder-probe display needs a stable identity that cannot be
     // inherited from a paired client's persisted state.

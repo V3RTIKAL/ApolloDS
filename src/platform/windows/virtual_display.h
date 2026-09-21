@@ -209,6 +209,12 @@ namespace VDISPLAY {
 
   uint64_t client_uuid_to_virtual_display_id(const GUID &client_guid);
   uuid_util::uuid_t virtualDisplayUuidFromStableId(const std::string &stable_id);
+  // Stream 1 owns a separate stable identity derived from the paired client.
+  // Cleanup must pass this exact GUID to removeVirtualDisplay(), never use the
+  // primary identity or the process-wide remove-all path.
+  uuid_util::uuid_t secondaryVirtualDisplayUuidFromStableId(std::string_view client_stable_id);
+  GUID secondaryVirtualDisplayGuid(std::string_view client_stable_id);
+  bool secondaryVirtualDisplayLeaseOwns(const GUID &lease_guid, const GUID &candidate_guid);
   GUID sharedVirtualDisplayGuid();
   bool is_sunshine_virtual_display_identity(
     const std::string &device_path,
