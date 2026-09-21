@@ -3,6 +3,18 @@ name: CI-Windows
 permissions: {}
 
 on:
+  workflow_dispatch:
+    inputs:
+      release_commit:
+        description: Commit to build
+        required: false
+        type: string
+        default: ''
+      release_version:
+        description: Package version
+        required: false
+        type: string
+        default: '0.0.0'
   workflow_call:
     inputs:
       release_commit:
@@ -136,7 +148,7 @@ jobs:
         id: resolve
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_COMMIT: ${{ inputs.release_commit }}
+          RELEASE_COMMIT: ${{ inputs.release_commit || github.sha }}
           RELEASE_TAG: ${{ inputs.release_tag }}
           RELEASE_VERSION: ${{ inputs.release_version }}
           REQUIRE_SIGNPATH_SIGNING: ${{ inputs.require_signpath_signing }}
@@ -247,7 +259,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
-          ref: ${{ inputs.release_commit }}
+          ref: ${{ inputs.release_commit || github.sha }}
           fetch-depth: 1
           submodules: recursive
 
@@ -430,7 +442,7 @@ jobs:
           # Do not use this environment variable name.
           MATRIX_MSYSTEM: ${{ matrix.msystem }}
           BRANCH: ${{ github.head_ref || github.ref_name }}
-          COMMIT: ${{ inputs.release_commit }}
+          COMMIT: ${{ inputs.release_commit || github.sha }}
           REQUIRE_TRUEHDR_RUNTIME: ${{ inputs.require_truehdr_runtime }}
         run: |
           echo "Using BUILD_VERSION=${BUILD_VERSION}"
@@ -931,7 +943,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
-          ref: ${{ inputs.release_commit }}
+          ref: ${{ inputs.release_commit || github.sha }}
           fetch-depth: 1
 
       - name: Download signed MSI
@@ -1313,7 +1325,7 @@ jobs:
       - name: Record release artifact provenance
         shell: pwsh
         env:
-          RELEASE_COMMIT: ${{ inputs.release_commit }}
+          RELEASE_COMMIT: ${{ inputs.release_commit || github.sha }}
           RELEASE_TAG: ${{ inputs.release_tag }}
           SOURCE_BUILD_RUN_ID: ${{ needs.release_artifacts.outputs.source_run_id }}
         run: |
