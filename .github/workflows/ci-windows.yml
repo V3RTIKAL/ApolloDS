@@ -260,7 +260,11 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           ref: ${{ inputs.release_commit || github.sha }}
-          fetch-depth: 1
+          # Validation builds derive an upgrade-safe version from the nearest
+          # release tag. A shallow, tagless checkout silently produced 0.0.0
+          # binaries that MSI would not overwrite over an installed release.
+          fetch-depth: 0
+          fetch-tags: true
           submodules: recursive
 
       - name: Resolve Windows build version
@@ -280,8 +284,18 @@ jobs:
             }
           }
 
-          if ([string]::IsNullOrWhiteSpace($buildVersion)) {
-            $buildVersion = '0.0.0'
+          # 0.0.0 is the caller's marker for an untagged validation build, not
+          # a safe Windows package version. MSI file versioning keeps a newer
+          # installed release executable when the incoming file is 0.0.0,
+          # yielding a mixed install (new service/package, stale sunshine.exe).
+          # Derive the next patch alpha so both MSI ProductVersion and PE file
+          # versions sort after the nearest merged release.
+          if ([string]::IsNullOrWhiteSpace($buildVersion) -or $buildVersion -eq '0.0.0') {
+            $tag = (& git tag --merged HEAD --sort=-version:refname --list | Where-Object { $_ -match '^v?\d+\.\d+\.\d+(?:[-.].*)?$' } | Select-Object -First 1)
+            if ([string]::IsNullOrWhiteSpace($tag) -or $tag -notmatch '^v?(\d+)\.(\d+)\.(\d+)') {
+              throw 'Unable to derive an upgrade-safe validation version from a merged release tag.'
+            }
+            $buildVersion = '{0}.{1}.{2}-alpha.1' -f [int]$Matches[1], [int]$Matches[2], ([int]$Matches[3] + 1)
           }
 
           if ($buildVersion -match '^v(.+)$') {
@@ -290,6 +304,25 @@ jobs:
 
           "Resolved Windows build version: $buildVersion"
           "BUILD_VERSION=$buildVersion" >> $env:GITHUB_ENV
+
+          if ($buildVersion -eq '0.0.0') {
+            throw 'Windows installer builds must never use the non-upgradeable 0.0.0 version.'
+          }
+
+          $versionRecord = [ordered]@{
+            build_version = $buildVersion
+            source_commit = (& git rev-parse HEAD).Trim()
+          }
+          $versionRecord | ConvertTo-Json | Set-Content -LiteralPath windows-build-identity.json -Encoding utf8
+
+      - name: Upload Windows build identity
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: windows-build-identity-${{ matrix.name }}
+          path: windows-build-identity.json
+          if-no-files-found: error
+          overwrite: true
+          retention-days: ${{ inputs.release_artifact_retention_days }}
 
       - name: Setup Dependencies Windows
         id: setup-msys2
@@ -694,6 +727,43 @@ jobs:
           msi_name="$(basename "${msi_path}")"
           cp "${msi_path}" "../unsigned-signpath-msi/${msi_name}"
           echo "msi_name=${msi_name}" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify packaged Windows binary identity
+        shell: pwsh
+        env:
+          MSI_NAME: ${{ steps.package-windows-msi.outputs.msi_name }}
+          EXPECTED_COMMIT: ${{ inputs.release_commit || github.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msi = Join-Path $PWD "unsigned-signpath-msi\$env:MSI_NAME"
+          $extractRoot = Join-Path $env:RUNNER_TEMP 'vibepollo-msi-identity'
+          Remove-Item -LiteralPath $extractRoot -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $extractRoot | Out-Null
+
+          $process = Start-Process msiexec.exe -ArgumentList @('/a', $msi, "TARGETDIR=$extractRoot", '/qn') -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "Administrative MSI extraction failed with exit code $($process.ExitCode)."
+          }
+
+          $sunshine = Get-ChildItem -LiteralPath $extractRoot -Recurse -Filter sunshine.exe -File | Select-Object -First 1
+          if (-not $sunshine) {
+            throw 'Packaged sunshine.exe was not found in the MSI.'
+          }
+
+          $productVersion = $sunshine.VersionInfo.ProductVersion
+          if ([string]::IsNullOrWhiteSpace($productVersion) -or $productVersion -eq '0.0.0') {
+            throw "Packaged sunshine.exe has a non-upgradeable ProductVersion: $productVersion"
+          }
+          if ($productVersion -ne $env:BUILD_VERSION) {
+            throw "Packaged sunshine.exe ProductVersion '$productVersion' does not match BUILD_VERSION '$env:BUILD_VERSION'."
+          }
+
+          $expectedShortCommit = $env:EXPECTED_COMMIT.Substring(0, 8)
+          $binaryText = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($sunshine.FullName))
+          if (-not $binaryText.Contains($expectedShortCommit)) {
+            throw "Packaged sunshine.exe does not contain expected source commit $expectedShortCommit."
+          }
+          "Verified packaged sunshine.exe: version=$productVersion, commit=$expectedShortCommit"
 
       - name: Upload unsigned MSI for SignPath
         id: upload-unsigned-msi
