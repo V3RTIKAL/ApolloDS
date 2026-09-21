@@ -9,11 +9,13 @@ extern "C" {
 }
 
 // standard includes
+#include <array>
 #include <atomic>
 #include <bitset>
 #include <chrono>
 #include <cmath>
 #include <list>
+#include <set>
 #include <thread>
 #include <unordered_map>
 
@@ -38,6 +40,13 @@ constexpr int WHEEL_DELTA = 120;
 using namespace std::literals;
 
 namespace input {
+
+  std::optional<std::size_t> client_display_index(std::uint16_t encoded_index) {
+    if (encoded_index >= CLIENT_DISPLAY_COUNT) {
+      return std::nullopt;
+    }
+    return static_cast<std::size_t>(encoded_index);
+  }
 
   constexpr auto MAX_GAMEPADS = std::min((std::size_t) platf::MAX_GAMEPADS, sizeof(std::int16_t) * 8);
 #define DISABLE_LEFT_BUTTON_DELAY ((thread_pool_util::ThreadPool::task_id_t) 0x01)
@@ -192,16 +201,19 @@ namespace input {
 
     input_t(
       safe::mail_raw_t::event_t<input::touch_port_t> touch_port_event,
+      safe::mail_raw_t::event_t<input::touch_port_t> touch_port_event2,
       platf::feedback_queue_t feedback_queue
     ):
         shortcutFlags {},
         gamepads(MAX_GAMEPADS),
         client_context {platf::allocate_client_input_context(platf_input)},
-        touch_port_event {std::move(touch_port_event)},
+        touch_port_events {{std::move(touch_port_event), std::move(touch_port_event2)}},
         feedback_queue {std::move(feedback_queue)},
         input_queue_task_scheduled {false},
         mouse_left_button_timeout {},
-        touch_port {{0, 0, 0, 0}, 0, 0, 1.0f, 1.0f, 0, 0},
+        touch_state_mutex {},
+        touch_ports {},
+        active_touch_ids {},
         accumulated_vscroll_delta {},
         accumulated_hscroll_delta {} {
     }
@@ -212,7 +224,7 @@ namespace input {
     std::vector<gamepad_t> gamepads;
     std::unique_ptr<platf::client_input_t> client_context;
 
-    safe::mail_raw_t::event_t<input::touch_port_t> touch_port_event;
+    std::array<safe::mail_raw_t::event_t<input::touch_port_t>, CLIENT_DISPLAY_COUNT> touch_port_events;
     platf::feedback_queue_t feedback_queue;
 
     std::list<std::vector<uint8_t>> input_queue;
@@ -221,7 +233,9 @@ namespace input {
 
     thread_pool_util::ThreadPool::task_id_t mouse_left_button_timeout;
 
-    input::touch_port_t touch_port;
+    std::mutex touch_state_mutex;
+    std::array<input::touch_port_t, CLIENT_DISPLAY_COUNT> touch_ports;
+    std::array<std::set<std::uint32_t>, CLIENT_DISPLAY_COUNT> active_touch_ids;
 
     int32_t accumulated_vscroll_delta;
     int32_t accumulated_hscroll_delta;
@@ -574,17 +588,7 @@ namespace input {
    * @param size The size of the client's surface containing the value.
    * @return The host-relative coordinate pair if a touchport is available.
    */
-  std::optional<std::pair<float, float>> client_to_touchport(std::shared_ptr<input_t> &input, const std::pair<float, float> &val, const std::pair<float, float> &size) {
-    auto &touch_port_event = input->touch_port_event;
-    auto &touch_port = input->touch_port;
-    if (touch_port_event->peek()) {
-      touch_port = *touch_port_event->pop();
-    }
-    if (!touch_port) {
-      BOOST_LOG(verbose) << "Ignoring early absolute input without a touch port"sv;
-      return std::nullopt;
-    }
-
+  std::optional<std::pair<float, float>> client_to_touchport(const input::touch_port_t &touch_port, const std::pair<float, float> &val, const std::pair<float, float> &size) {
     auto scalarX = touch_port.width / size.first;
     auto scalarY = touch_port.height / size.second;
 
@@ -628,6 +632,28 @@ namespace input {
     float final_y = y / touch_port.scalar_tpcoords;
 #endif
     return std::pair {final_x, final_y};
+  }
+
+  std::optional<input::touch_port_t> active_touch_port(std::shared_ptr<input_t> &input, std::uint16_t encoded_index) {
+    const auto index = client_display_index(encoded_index);
+    if (!index) {
+      BOOST_LOG(warning) << "Ignoring absolute input for unknown display index "sv << encoded_index;
+      return std::nullopt;
+    }
+
+    auto &touch_port_event = input->touch_port_events[*index];
+    std::scoped_lock lock {input->touch_state_mutex};
+    auto &touch_port = input->touch_ports[*index];
+    if (touch_port_event->peek()) {
+      if (auto updated_port = touch_port_event->pop(0ms)) {
+        touch_port = *updated_port;
+      }
+    }
+    if (!touch_port) {
+      BOOST_LOG(verbose) << "Ignoring early absolute input without a touch port for display "sv << *index;
+      return std::nullopt;
+    }
+    return touch_port;
   }
 
   /**
@@ -686,26 +712,30 @@ namespace input {
     auto width = (float) util::endian::big(packet->width);
     auto height = (float) util::endian::big(packet->height);
 
-    auto tpcoords = client_to_touchport(input, {x, y}, {width, height});
+    const auto encoded_index = util::endian::big(static_cast<std::uint16_t>(packet->unused));
+    auto touch_port = active_touch_port(input, encoded_index);
+    if (!touch_port) {
+      return;
+    }
+
+    auto tpcoords = client_to_touchport(*touch_port, {x, y}, {width, height});
     if (!tpcoords) {
       return;
     }
 
-    auto &touch_port = input->touch_port;
-
     int touch_port_dim_x;
     int touch_port_dim_y;
-    if (touch_port.env_logical_width != 0 && touch_port.env_logical_height != 0) {
-      touch_port_dim_x = touch_port.env_logical_width;
-      touch_port_dim_y = touch_port.env_logical_height;
+    if (touch_port->env_logical_width != 0 && touch_port->env_logical_height != 0) {
+      touch_port_dim_x = touch_port->env_logical_width;
+      touch_port_dim_y = touch_port->env_logical_height;
     } else {
-      touch_port_dim_x = touch_port.env_width;
-      touch_port_dim_y = touch_port.env_height;
+      touch_port_dim_x = touch_port->env_width;
+      touch_port_dim_y = touch_port->env_height;
     }
 
     platf::touch_port_t abs_port {
-      touch_port.offset_x,
-      touch_port.offset_y,
+      touch_port->offset_x,
+      touch_port->offset_y,
       touch_port_dim_x,
       touch_port_dim_y
     };
@@ -1063,6 +1093,42 @@ namespace input {
     };
   }
 
+  void cancel_display_touches_impl(std::shared_ptr<input_t> &input, std::size_t display_index, bool clear_port) {
+    if (!input || display_index >= CLIENT_DISPLAY_COUNT) {
+      return;
+    }
+
+    std::scoped_lock lock {input->touch_state_mutex};
+    auto &touch_port = input->touch_ports[display_index];
+    auto &active_pointers = input->active_touch_ids[display_index];
+    std::pair<float, float> origin {
+      static_cast<float>(touch_port.offset_x),
+      static_cast<float>(touch_port.offset_y),
+    };
+    const auto logical_port = monitor_touch_port(touch_port, origin).value_or(platf::touch_port_t {});
+    for (const auto active_pointer : active_pointers) {
+      const platf::touch_input_t cancel {
+        LI_TOUCH_EVENT_CANCEL,
+        LI_ROT_UNKNOWN,
+        active_pointer,
+        0.0f,
+        0.0f,
+        0.0f,
+        0.0f,
+        0.0f,
+      };
+      platf::touch_update(input->client_context.get(), logical_port, cancel);
+    }
+    active_pointers.clear();
+    if (clear_port) {
+      touch_port = {};
+    }
+  }
+
+  void cancel_display_touches(std::shared_ptr<input_t> &input, std::size_t display_index) {
+    cancel_display_touches_impl(input, display_index, true);
+  }
+
   /**
    * @brief Called to pass a touch message to the platform backend.
    * @param input The input context pointer.
@@ -1073,26 +1139,42 @@ namespace input {
       return;
     }
 
-    // Convert the client normalized coordinates to touchport coordinates
-    auto coords = client_to_touchport(input, {from_clamped_netfloat(packet->x, 0.0f, 1.0f) * 65535.f, from_clamped_netfloat(packet->y, 0.0f, 1.0f) * 65535.f}, {65535.f, 65535.f});
+    const auto display_index = client_display_index(packet->zero[0]);
+    if (!display_index) {
+      BOOST_LOG(warning) << "Ignoring touch input for unknown display index "sv << static_cast<std::uint32_t>(packet->zero[0]);
+      return;
+    }
+    // CANCEL_ALL is display-scoped and must not depend on a fresh coordinate
+    // mapping or a currently published touch port. Teardown can race the last
+    // monitor event, so cancel the tracked pointers first.
+    if (packet->eventType == LI_TOUCH_EVENT_CANCEL_ALL) {
+      cancel_display_touches_impl(input, *display_index, false);
+      return;
+    }
+
+    auto touch_port = active_touch_port(input, packet->zero[0]);
+    if (!touch_port) {
+      return;
+    }
+
+    auto coords = client_to_touchport(*touch_port, {from_clamped_netfloat(packet->x, 0.0f, 1.0f) * 65535.f, from_clamped_netfloat(packet->y, 0.0f, 1.0f) * 65535.f}, {65535.f, 65535.f});
     if (!coords) {
       return;
     }
 
-    auto &touch_port = input->touch_port;
-
-    auto abs_port = monitor_touch_port(touch_port, *coords);
+    auto abs_port = monitor_touch_port(*touch_port, *coords);
     if (!abs_port) {
       return;
     }
 
-    // Normalize rotation value to 0-359 degree range
+    const auto pointer_id = util::endian::little(packet->pointerId) |
+                            (*display_index == 0 ? 0U : 0x80000000U);
+
     auto rotation = util::endian::little(packet->rotation);
     if (rotation != LI_ROT_UNKNOWN) {
       rotation %= 360;
     }
 
-    // Normalize the contact area based on the touchport
     auto contact_area = scale_client_contact_area(
       {from_clamped_netfloat(packet->contactAreaMajor, 0.0f, 1.0f) * 65535.f,
        from_clamped_netfloat(packet->contactAreaMinor, 0.0f, 1.0f) * 65535.f},
@@ -1103,7 +1185,7 @@ namespace input {
     platf::touch_input_t touch {
       packet->eventType,
       rotation,
-      util::endian::little(packet->pointerId),
+      pointer_id,
       coords->first,
       coords->second,
       from_clamped_netfloat(packet->pressureOrDistance, 0.0f, 1.0f),
@@ -1111,7 +1193,26 @@ namespace input {
       contact_area.second,
     };
 
+    std::scoped_lock touch_lock {input->touch_state_mutex};
+    if (!input->touch_ports[*display_index]) {
+      return;
+    }
     platf::touch_update(input->client_context.get(), *abs_port, touch);
+    auto &active_pointers = input->active_touch_ids[*display_index];
+    switch (packet->eventType) {
+      case LI_TOUCH_EVENT_HOVER:
+      case LI_TOUCH_EVENT_DOWN:
+      case LI_TOUCH_EVENT_MOVE:
+        active_pointers.emplace(pointer_id);
+        break;
+      case LI_TOUCH_EVENT_UP:
+      case LI_TOUCH_EVENT_CANCEL:
+      case LI_TOUCH_EVENT_HOVER_LEAVE:
+        active_pointers.erase(pointer_id);
+        break;
+      default:
+        break;
+    }
   }
 
   /**
@@ -1124,15 +1225,18 @@ namespace input {
       return;
     }
 
-    // Convert the client normalized coordinates to touchport coordinates
-    auto coords = client_to_touchport(input, {from_clamped_netfloat(packet->x, 0.0f, 1.0f) * 65535.f, from_clamped_netfloat(packet->y, 0.0f, 1.0f) * 65535.f}, {65535.f, 65535.f});
+    auto touch_port = active_touch_port(input, 0);
+    if (!touch_port) {
+      return;
+    }
+
+    // Pen packets predate indexed input and therefore target the primary display.
+    auto coords = client_to_touchport(*touch_port, {from_clamped_netfloat(packet->x, 0.0f, 1.0f) * 65535.f, from_clamped_netfloat(packet->y, 0.0f, 1.0f) * 65535.f}, {65535.f, 65535.f});
     if (!coords) {
       return;
     }
 
-    auto &touch_port = input->touch_port;
-
-    auto abs_port = monitor_touch_port(touch_port, *coords);
+    auto abs_port = monitor_touch_port(*touch_port, *coords);
     if (!abs_port) {
       return;
     }
@@ -1913,6 +2017,7 @@ namespace input {
   std::shared_ptr<input_t> alloc(safe::mail_t mail) {
     auto input = std::make_shared<input_t>(
       mail->event<input::touch_port_t>(mail::touch_port),
+      mail->event<input::touch_port_t>(mail::touch_port2),
       mail->queue<platf::gamepad_feedback_msg_t>(mail::gamepad_feedback)
     );
 

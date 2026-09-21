@@ -5,6 +5,8 @@
 #pragma once
 
 // standard includes
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <optional>
 #include <utility>
@@ -19,6 +21,10 @@ namespace input {
   struct input_t;
   struct touch_port_t;
 
+  constexpr std::size_t CLIENT_DISPLAY_COUNT = 2;
+
+  [[nodiscard]] std::optional<std::size_t> client_display_index(std::uint16_t encoded_index);
+
   void print(void *input);
   void reset(std::shared_ptr<input_t> &input);
   void passthrough(std::shared_ptr<input_t> &input, std::vector<std::uint8_t> &&input_data, const crypto::PERM &permission);
@@ -32,6 +38,8 @@ namespace input {
   bool probe_gamepads();
 
   std::shared_ptr<input_t> alloc(safe::mail_t mail);
+
+  void cancel_display_touches(std::shared_ptr<input_t> &input, std::size_t display_index);
 
   struct touch_port_t: public platf::touch_port_t {
     int env_width;
