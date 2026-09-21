@@ -6,6 +6,8 @@
 #include "../tests_common.h"
 #include "src/stream_protocol.h"
 
+#include <climits>
+
 TEST(VideoFormatNameTests, CanonicalCodecNameNormalizesKnownAliases) {
   EXPECT_EQ(stream::canonical_codec_name("h264"), "H.264");
   EXPECT_EQ(stream::canonical_codec_name("H.264"), "H.264");
@@ -68,4 +70,58 @@ TEST(ControlPacketParsing, AllowsTypeOnlyPacketWithoutPayloadUnderflow) {
   ASSERT_TRUE(decoded);
   EXPECT_EQ(decoded->type, 0x1234);
   EXPECT_TRUE(decoded->payload.empty());
+}
+
+TEST(StreamTargetParsing, PreservesLegacyTargetsAsStreamZero) {
+  for (const auto target : {"video", "audio", "control", "rtsp://host/streamid=video"}) {
+    const auto parsed = stream::parse_stream_target(target);
+    ASSERT_TRUE(parsed) << target;
+    EXPECT_EQ(parsed->index, 0U) << target;
+  }
+}
+
+TEST(StreamTargetParsing, AcceptsBothSupportedIndexedVideoTargets) {
+  const auto primary = stream::parse_stream_target("rtsp://host/streamid=video/0/0");
+  const auto secondary = stream::parse_stream_target("streamid=video/1/0");
+
+  ASSERT_TRUE(primary);
+  EXPECT_EQ(primary->type, "video");
+  EXPECT_EQ(primary->index, 0U);
+  ASSERT_TRUE(secondary);
+  EXPECT_EQ(secondary->type, "video");
+  EXPECT_EQ(secondary->index, 1U);
+}
+
+TEST(StreamTargetParsing, RejectsMalformedOrUnsupportedVideoIndices) {
+  for (const auto target : {
+         "video/2/0",
+         "video/-1/0",
+         "video/01/0",
+         "video/1",
+         "video//0",
+         "video/1/1",
+         "video/1/0/extra",
+         "prefixstreamid=video/1/0",
+         "streamid=video/1x/0",
+       }) {
+    EXPECT_FALSE(stream::parse_stream_target(target)) << target;
+  }
+}
+
+TEST(DualVideoBitrateBudget, LeavesRequestsWithinCeilingUnchanged) {
+  EXPECT_EQ(stream::budget_dual_video_bitrates(6000, 3000, 10000), (std::pair {6000, 3000}));
+  EXPECT_EQ(stream::budget_dual_video_bitrates(6000, 3000, 0), (std::pair {6000, 3000}));
+}
+
+TEST(DualVideoBitrateBudget, CapsAggregateAndPreservesPrimaryFirst) {
+  EXPECT_EQ(stream::budget_dual_video_bitrates(8000, 8000, 10000), (std::pair {8000, 2000}));
+  EXPECT_EQ(stream::budget_dual_video_bitrates(3000, 9000, 10000), (std::pair {3000, 7000}));
+}
+
+TEST(DualVideoBitrateBudget, HandlesOverflowWithoutExceedingCeiling) {
+  const auto budget = stream::budget_dual_video_bitrates(INT_MAX, INT_MAX, 10000);
+
+  EXPECT_EQ(budget.first, 8000);
+  EXPECT_EQ(budget.second, 2000);
+  EXPECT_LE(static_cast<std::int64_t>(budget.first) + budget.second, 10000);
 }

@@ -33,6 +33,7 @@ namespace stream {
   constexpr auto VIDEO_STREAM_PORT = 9;
   constexpr auto CONTROL_PORT = 10;
   constexpr auto AUDIO_STREAM_PORT = 11;
+  constexpr auto VIDEO_STREAM_2_PORT = 12;  ///< Reserved for H2's independently bound secondary video socket.
 
   constexpr std::string_view video_format_name(int video_format) {
     switch (video_format) {

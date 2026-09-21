@@ -39,6 +39,7 @@ extern "C" {
 #include "nvhttp.h"
 #include "rtsp.h"
 #include "stream.h"
+#include "stream_protocol.h"
 #include "sync.h"
 #include "thread_pool.h"
 #include "video.h"
@@ -1501,19 +1502,22 @@ namespace rtsp_stream {
     auto seqn_str = std::to_string(req->sequenceNumber);
     seqn.content = const_cast<char *>(seqn_str.c_str());
 
-    std::string_view target {req->message.request.target};
-    auto begin = std::find(std::begin(target), std::end(target), '=') + 1;
-    auto end = std::find(begin, std::end(target), '/');
-    std::string_view type {begin, (size_t) std::distance(begin, end)};
+    const auto target = stream::parse_stream_target(req->message.request.target);
+    if (!target) {
+      cmd_not_found(server, socket, session, std::move(req));
+      return false;
+    }
 
     std::uint16_t port;
-    if (type == "audio"sv) {
+    if (target->type == "audio"sv && target->index == 0) {
       port = net::map_port(stream::AUDIO_STREAM_PORT);
-    } else if (type == "video"sv) {
+    } else if (target->type == "video"sv && target->index == 0) {
       port = net::map_port(stream::VIDEO_STREAM_PORT);
-    } else if (type == "control"sv) {
+    } else if (target->type == "control"sv &&
+               (target->index == 0 || target->index == 1 || target->index == 13)) {
       port = net::map_port(stream::CONTROL_PORT);
     } else {
+      // H2 will accept video/1 only after reserving a distinct UDP socket.
       cmd_not_found(server, socket, session, std::move(req));
       return false;
     }
@@ -1533,7 +1537,7 @@ namespace rtsp_stream {
 
     // Send identifiers that will be echoed in the other connections
     auto connect_data = std::to_string(session->control_connect_data);
-    if (type == "control"sv) {
+    if (target->type == "control"sv) {
       payload_option.option = const_cast<char *>("X-SS-Connect-Data");
       payload_option.content = connect_data.data();
     } else {

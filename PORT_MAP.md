@@ -10,11 +10,11 @@
 
 | Milestone | Donor behavior | Vibepollo target | Action |
 |---|---|---|---|
-| H1 | `MaxVideoStreams=2` when stream 1 is genuinely available | `src/nvhttp.cpp` server-info generation | ADAPT; retain current encoder/VDD discovery |
-| H1 | Strict indexed RTSP target parsing (`video/0/0`, `video/1/0`) | `src/rtsp.cpp`, new pure helpers in `src/stream_protocol.{h,cpp}` | REIMPLEMENT AGAINST CURRENT API |
-| H1 | Explicit `x-ml-video[1].enable` and indexed viewport/FPS/bitrate | `rtsp_stream::cmd_announce`, `launch_session_t` | ADAPT; stream 1 remains optional |
-| H1 | Aggregate primary-first bitrate budget | protocol helper plus `cmd_announce` | COPY SMALL LOGIC with overflow validation |
-| H1/H2 | Reserve UDP offset 12 across SETUP-to-ANNOUNCE | `launch_session_t`, broadcast socket lifecycle, `src/stream.h` | REIMPLEMENT AGAINST CURRENT API |
+| H1 | `MaxVideoStreams=2` when stream 1 is genuinely available | `src/nvhttp.cpp` server-info generation | FOUNDATION COMPLETE; explicitly advertises `1` until H2 readiness exists |
+| H1 | Strict indexed RTSP target parsing (`video/0/0`, `video/1/0`) | `src/rtsp.cpp`, pure helpers in `src/stream_protocol.{h,cpp}` | COMPLETE; SETUP parses both but rejects stream 1 until H2 reservation |
+| H1 | Explicit `x-ml-video[1].enable` and indexed viewport/FPS/bitrate | `rtsp_stream::cmd_announce`, `launch_session_t` | DEFERRED TO H2; unsafe before independent transport exists |
+| H1 | Aggregate primary-first bitrate budget | `src/stream_protocol.{h,cpp}` | HELPER COMPLETE; ANNOUNCE wiring deferred with secondary config |
+| H1/H2 | Reserve UDP offset 12 across SETUP-to-ANNOUNCE | `launch_session_t`, broadcast socket lifecycle, `src/stream.h` | OFFSET 12 RESERVED; socket lifecycle remains H2 |
 | H2 | Independent UDP/RTP sender, sequence/FEC/IV/IDR state | `src/stream.cpp`, `src/globals.h` | ADAPT existing sender with indexed state; do not copy whole sender |
 | H2 | Secondary-only failure and indexed termination | `stream::session_t`, control server | ADAPT; never call whole-session stop for stream 1 failure |
 | H3 | Independent capture/encoder publishing to video queue 2 | `src/video.cpp`, `src/video.h`, `src/stream.cpp` | REIMPLEMENT AGAINST CURRENT API using explicit output name |

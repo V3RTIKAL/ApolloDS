@@ -4,9 +4,23 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace stream {
+  struct stream_target_t {
+    std::string_view type;
+    std::uint32_t index;
+  };
+
+  [[nodiscard]] std::optional<stream_target_t> parse_stream_target(std::string_view target);
+
+  [[nodiscard]] std::pair<int, int> budget_dual_video_bitrates(
+    int primary_kbps,
+    int secondary_kbps,
+    int ceiling_kbps
+  );
+
   inline std::string canonical_codec_name(std::string_view codec) {
     if (codec.empty()) {
       return {};
