@@ -552,27 +552,9 @@ jobs:
         if: inputs.build_tests
         run: ctest --test-dir build/tests --output-on-failure --parallel 2 --timeout 120
 
-      - name: Smoke-test built executable startup
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Continue'
-          $stdout = Join-Path $env:RUNNER_TEMP 'sunshine-version.stdout.txt'
-          $stderr = Join-Path $env:RUNNER_TEMP 'sunshine-version.stderr.txt'
-          $process = Start-Process -FilePath '.\build\sunshine.exe' -ArgumentList '--version' `
-            -RedirectStandardOutput $stdout -RedirectStandardError $stderr -Wait -PassThru
-          $output = @()
-          if (Test-Path -LiteralPath $stdout) { $output += Get-Content -LiteralPath $stdout }
-          if (Test-Path -LiteralPath $stderr) { $output += Get-Content -LiteralPath $stderr }
-          $output | Write-Host
-          if ($process.ExitCode -ne 0 -or ($output -join "`n") -match 'terminate called|std::system_error') {
-            throw "Built sunshine.exe failed the --version startup smoke test (exit $($process.ExitCode))."
-          }
-
       - name: Install cv2pdb
-        # Validation builds must retain symbols until their packaged executable
-        # has passed an actual startup smoke test. Otherwise a constructor-time
-        # crash produces only unusable Opus-relative addresses.
-        if: startsWith(github.ref, 'refs/tags/') || inputs.publish_symbols || inputs.upload_symbols_artifact || github.event_name == 'workflow_dispatch'
+        # Generate matching symbols before executing sunshine.exe so startup
+        # failures can be symbolized before the mandatory gate fails.
         shell: pwsh
         env:
           CV2PDB_VERSION: "0.54"
@@ -581,21 +563,16 @@ jobs:
           $cv2pdbDir = Join-Path $env:RUNNER_TEMP 'cv2pdb'
           $cv2pdbZip = Join-Path $env:RUNNER_TEMP 'cv2pdb.zip'
           $cv2pdbUrl = "https://github.com/rainers/cv2pdb/releases/download/v${env:CV2PDB_VERSION}/cv2pdb-${env:CV2PDB_VERSION}.zip"
-
           Invoke-WebRequest -Uri $cv2pdbUrl -OutFile $cv2pdbZip
           Expand-Archive -Path $cv2pdbZip -DestinationPath $cv2pdbDir -Force
-          $cv2pdbExe = Get-ChildItem -Path $cv2pdbDir -Recurse -Filter cv2pdb64.exe -File | Select-Object -First 1
-          if (-not $cv2pdbExe) {
-            throw 'cv2pdb64.exe was not found in the downloaded archive.'
-          }
-          Add-Content -Path $env:GITHUB_PATH -Value (Split-Path $cv2pdbExe.FullName -Parent)
+          $cv2pdbExe = Get-ChildItem -LiteralPath $cv2pdbDir -Recurse -Filter cv2pdb64.exe -File | Select-Object -First 1
+          if (-not $cv2pdbExe) { throw 'cv2pdb64.exe was not found in the downloaded archive.' }
+          "CV2PDB_EXE=$($cv2pdbExe.FullName)" >> $env:GITHUB_ENV
 
       - name: Generate Windows PDB
-        if: startsWith(github.ref, 'refs/tags/') || inputs.publish_symbols || inputs.upload_symbols_artifact || github.event_name == 'workflow_dispatch'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-
           $executables = @(
             '.\build\sunshine.exe',
             '.\build\tools\audio-info.exe',
@@ -605,28 +582,187 @@ jobs:
             '.\build\tools\sunshine_wgc_capture.exe',
             '.\build\tools\sunshinesvc.exe'
           )
-
           foreach ($exe in $executables) {
             if (Test-Path -LiteralPath $exe) {
-              & cv2pdb64.exe $exe
-              if ($LASTEXITCODE -ne 0) {
-                throw "PDB conversion failed for $exe (exit code $LASTEXITCODE)."
-              }
-              $pdb = [System.IO.Path]::ChangeExtension($exe, '.pdb')
-              if (-not (Test-Path -LiteralPath $pdb)) {
-                throw "PDB conversion produced no symbols for $exe."
-              }
+              & $env:CV2PDB_EXE $exe
+              if ($LASTEXITCODE -ne 0) { throw "PDB conversion failed for $exe (exit code $LASTEXITCODE)." }
+              $pdb = [IO.Path]::ChangeExtension($exe, '.pdb')
+              if (-not (Test-Path -LiteralPath $pdb)) { throw "PDB conversion produced no symbols for $exe." }
             }
           }
-
           $sunshineSvc = '.\build\tools\sunshinesvc.exe'
           $sunshineSvcPayload = '.\build\wix_payload\tools\sunshinesvc.exe'
           if ((Test-Path -LiteralPath $sunshineSvc) -and (Test-Path -LiteralPath $sunshineSvcPayload)) {
             Copy-Item -LiteralPath $sunshineSvc -Destination $sunshineSvcPayload -Force
           }
 
+      - name: Smoke-test built executable startup
+        id: smoke-test-startup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $diagnostics = Join-Path $env:RUNNER_TEMP 'sunshine-startup-diagnostics'
+          New-Item -ItemType Directory -Path $diagnostics -Force | Out-Null
+          $stdout = Join-Path $diagnostics 'current.stdout.txt'
+          $stderr = Join-Path $diagnostics 'current.stderr.txt'
+          $process = Start-Process -FilePath '.\build\sunshine.exe' -ArgumentList '--version' -RedirectStandardOutput $stdout -RedirectStandardError $stderr -Wait -PassThru
+          $output = @()
+          if (Test-Path -LiteralPath $stdout) { $output += Get-Content -LiteralPath $stdout }
+          if (Test-Path -LiteralPath $stderr) { $output += Get-Content -LiteralPath $stderr }
+          $output | Write-Host
+          $failed = $process.ExitCode -ne 0 -or ($output -join "`n") -match 'terminate called|std::system_error'
+          "failed=$($failed.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          "exit_code=$($process.ExitCode)" >> $env:GITHUB_OUTPUT
+          "Current startup result: failed=$failed exit=$($process.ExitCode)"
+
+      - name: Resolve CDB
+        if: steps.smoke-test-startup.outputs.failed == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $kitsRoot = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots' -Name KitsRoot10).KitsRoot10
+          $cdb = Join-Path $kitsRoot 'Debuggers\x64\cdb.exe'
+          if (-not (Test-Path -LiteralPath $cdb)) {
+            $installer = Get-ItemProperty 'HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' |
+              Where-Object { $_.DisplayName -match 'Windows Software Development Kit' -and $_.BundleCachePath } |
+              Sort-Object DisplayVersion -Descending |
+              Select-Object -First 1
+            if (-not $installer) { throw "cdb.exe is absent and no cached Windows SDK installer was found: $cdb" }
+            $install = Start-Process -FilePath $installer.BundleCachePath `
+              -ArgumentList @('/features', 'OptionId.WindowsDesktopDebuggers', '/q', '/norestart') -Wait -PassThru
+            if ($install.ExitCode -ne 0) { throw "Windows debugging-tools installation failed with exit $($install.ExitCode)." }
+          }
+          if (-not (Test-Path -LiteralPath $cdb)) { throw "Windows debugging-tools installation produced no cdb.exe: $cdb" }
+          "CDB_EXE=$cdb" >> $env:GITHUB_ENV
+          & $cdb -version
+
+      - name: Capture current first-chance C++ exception
+        if: steps.smoke-test-startup.outputs.failed == 'true'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $diagnostics = Join-Path $env:RUNNER_TEMP 'sunshine-startup-diagnostics'
+          $exe = (Resolve-Path '.\build\sunshine.exe').Path
+          $log = Join-Path $diagnostics 'current-cdb.txt'
+          $dump = Join-Path $diagnostics 'current-first-chance.dmp'
+          $symbolPath = "$(Split-Path $exe -Parent);srv*$diagnostics\symbols*https://msdl.microsoft.com/download/symbols"
+          $commands = "sxe -c `".echo === GCC C++ first chance 0x20474343 ===; .exr -1; kv 100; ~*kv 40; .dump /ma $dump; q`" 20474343; g"
+          & $env:CDB_EXE -lines -y $symbolPath -srcpath $env:GITHUB_WORKSPACE -logou $log -c $commands $exe --version
+          "cdb exit code: $LASTEXITCODE" | Add-Content -LiteralPath $log
+          Get-Content -LiteralPath $log -ErrorAction SilentlyContinue | Write-Host
+
+      - name: Build pristine baseline e3ebca75
+        if: steps.smoke-test-startup.outputs.failed == 'true'
+        id: build-startup-baseline
+        continue-on-error: true
+        shell: msys2 {0}
+        env:
+          BASELINE_COMMIT: e3ebca75ec06f975699bf38f46012b96db9c3e44
+          REQUIRE_TRUEHDR_RUNTIME: ${{ inputs.require_truehdr_runtime }}
+        run: |
+          set -euo pipefail
+          baseline_root="${RUNNER_TEMP}/apollo-baseline-e3ebca75"
+          baseline_build="${RUNNER_TEMP}/apollo-baseline-e3ebca75-build"
+          rm -rf "${baseline_root}" "${baseline_build}"
+          git worktree add --detach "${baseline_root}" "${BASELINE_COMMIT}"
+          git -C "${baseline_root}" submodule update --init --recursive
+          NODEJS_PATH=$(cygpath -u "$NODEJS_PATH")
+          export PATH="${NODEJS_PATH}:$PATH"
+          NPM_PATH="$(cygpath -m "${NODEJS_PATH}/npm.cmd")"
+          vdd_prebuilt_arg=()
+          if [[ -n "${VDD_PREBUILT_PACKAGE_DIR:-}" ]]; then
+            vdd_prebuilt_arg=(-DSUNSHINE_LIBVIRTUALDISPLAY_PREBUILT_DIR="$(cygpath -u "${VDD_PREBUILT_PACKAGE_DIR}")")
+          fi
+          truehdr_runtime_arg=()
+          if [[ "${REQUIRE_TRUEHDR_RUNTIME}" == "true" ]]; then
+            truehdr_runtime_arg=(-DSUNSHINE_TRUEHDR_RUNTIME_DIR="$(cygpath -u "${SUNSHINE_TRUEHDR_RUNTIME_DIR}")" -DSUNSHINE_REQUIRE_TRUEHDR_RUNTIME=ON)
+          fi
+          cmake -B "${baseline_build}" -G Ninja -S "${baseline_root}" \
+            -DBUILD_WERROR=ON -DBUILD_TESTS=OFF \
+            -DBUILD_SUNSHINE_VIRTUAL_DISPLAY_DRIVER=OFF \
+            -DBUILD_VIRTUALDISPLAY_PROBE=OFF -DBUILD_VIRTUALDISPLAY_TOOLS=OFF \
+            -DBUILD_VIRTUALDISPLAY_VULKAN_LAYER=OFF -DBUILD_DOCS=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS_RELEASE="-O3 -DNDEBUG -g -gdwarf-4" \
+            -DCMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG -g -gdwarf-4" \
+            -DSUNSHINE_ENABLE_WEBRTC=ON \
+            -DWEBRTC_ROOT="$(cygpath -u "${WEBRTC_ROOT}")" \
+            -DWEBRTC_INCLUDE_DIR="$(cygpath -u "${WEBRTC_ROOT}")/include" \
+            -DWEBRTC_LIBRARY="$(cygpath -u "${WEBRTC_ROOT}")/lib/libwebrtc.dll.a" \
+            -DWEBRTC_MSYS2_BIN="$(cygpath -u "${WEBRTC_MSYS2_BIN}")" \
+            -DWEBRTC_VS_PATH="$(cygpath -u "${WEBRTC_VS_PATH}")" \
+            -DWEBRTC_WINSDK_DIR="$(cygpath -u "${WEBRTC_WINSDK_DIR}")" \
+            -DSUNSHINE_NPM_EXECUTABLE="${NPM_PATH}" -DSUNSHINE_ASSETS_DIR=assets \
+            -DSUNSHINE_PUBLISHER_NAME="${GITHUB_REPOSITORY_OWNER}" \
+            -DSUNSHINE_PUBLISHER_WEBSITE="https://app.lizardbyte.dev" \
+            -DSUNSHINE_PUBLISHER_ISSUE_URL="https://app.lizardbyte.dev/support" \
+            "${vdd_prebuilt_arg[@]}" "${truehdr_runtime_arg[@]}"
+          cmake --build "${baseline_build}" --target sunshine -j "$(nproc)"
+
+      - name: Run pristine baseline startup diagnostic
+        if: always() && !cancelled() && steps.smoke-test-startup.outputs.failed == 'true'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $diagnostics = Join-Path $env:RUNNER_TEMP 'sunshine-startup-diagnostics'
+          $baselineBuild = Join-Path $env:RUNNER_TEMP 'apollo-baseline-e3ebca75-build'
+          $baselineSource = Join-Path $env:RUNNER_TEMP 'apollo-baseline-e3ebca75'
+          $exe = Join-Path $baselineBuild 'sunshine.exe'
+          $summary = Join-Path $diagnostics 'baseline-result.txt'
+          if (-not (Test-Path -LiteralPath $exe)) {
+            "Baseline build did not produce $exe; build outcome=${{ steps.build-startup-baseline.outcome }}" | Set-Content -LiteralPath $summary
+            Get-Content -LiteralPath $summary | Write-Host
+            exit 0
+          }
+          & $env:CV2PDB_EXE $exe
+          $pdb = [IO.Path]::ChangeExtension($exe, '.pdb')
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $pdb)) {
+            "Baseline cv2pdb failed with exit $LASTEXITCODE" | Set-Content -LiteralPath $summary
+            exit 0
+          }
+          $stdout = Join-Path $diagnostics 'baseline.stdout.txt'
+          $stderr = Join-Path $diagnostics 'baseline.stderr.txt'
+          $process = Start-Process -FilePath $exe -ArgumentList '--version' -RedirectStandardOutput $stdout -RedirectStandardError $stderr -Wait -PassThru
+          $output = @()
+          if (Test-Path -LiteralPath $stdout) { $output += Get-Content -LiteralPath $stdout }
+          if (Test-Path -LiteralPath $stderr) { $output += Get-Content -LiteralPath $stderr }
+          $failed = $process.ExitCode -ne 0 -or ($output -join "`n") -match 'terminate called|std::system_error'
+          "Baseline e3ebca75 startup: failed=$failed exit=$($process.ExitCode)" | Set-Content -LiteralPath $summary
+          $output | Add-Content -LiteralPath $summary
+          Get-Content -LiteralPath $summary | Write-Host
+          if ($failed -and (Test-Path -LiteralPath $env:CDB_EXE)) {
+            $log = Join-Path $diagnostics 'baseline-cdb.txt'
+            $dump = Join-Path $diagnostics 'baseline-first-chance.dmp'
+            $symbolPath = "$baselineBuild;srv*$diagnostics\symbols*https://msdl.microsoft.com/download/symbols"
+            $commands = "sxe -c `".echo === GCC C++ first chance 0x20474343 ===; .exr -1; kv 100; ~*kv 40; .dump /ma $dump; q`" 20474343; g"
+            & $env:CDB_EXE -lines -y $symbolPath -srcpath $baselineSource -logou $log -c $commands $exe --version
+            "cdb exit code: $LASTEXITCODE" | Add-Content -LiteralPath $log
+            Get-Content -LiteralPath $log -ErrorAction SilentlyContinue | Write-Host
+          }
+
+      - name: Upload sunshine startup diagnostics
+        if: always() && !cancelled() && steps.smoke-test-startup.outputs.failed == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: sunshine-startup-diagnostics-${{ matrix.name }}
+          path: |
+            ${{ runner.temp }}/sunshine-startup-diagnostics/
+            build/sunshine.exe
+            build/sunshine.pdb
+            ${{ runner.temp }}/apollo-baseline-e3ebca75-build/sunshine.exe
+            ${{ runner.temp }}/apollo-baseline-e3ebca75-build/sunshine.pdb
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Enforce sunshine startup gate
+        if: always() && !cancelled() && steps.smoke-test-startup.outputs.failed == 'true'
+        shell: pwsh
+        run: throw "Built sunshine.exe failed the --version startup gate (exit ${{ steps.smoke-test-startup.outputs.exit_code }}). Diagnostics were uploaded first."
+
       - name: Package Windows Symbols
-        if: startsWith(github.ref, 'refs/tags/') || inputs.publish_symbols || inputs.upload_symbols_artifact || github.event_name == 'workflow_dispatch'
+        if: always() && !cancelled() && (startsWith(github.ref, 'refs/tags/') || inputs.publish_symbols || inputs.upload_symbols_artifact || github.event_name == 'workflow_dispatch')
         id: package-windows-symbols
         shell: pwsh
         env:
@@ -806,7 +942,7 @@ jobs:
           overwrite: true
 
       - name: Upload Windows symbols package
-        if: startsWith(github.ref, 'refs/tags/') || inputs.publish_symbols || inputs.upload_symbols_artifact || github.event_name == 'workflow_dispatch'
+        if: always() && !cancelled() && (startsWith(github.ref, 'refs/tags/') || inputs.publish_symbols || inputs.upload_symbols_artifact || github.event_name == 'workflow_dispatch')
         id: upload-windows-symbols
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
