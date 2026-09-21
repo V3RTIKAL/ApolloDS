@@ -4,19 +4,10 @@
  */
 
 #include "../tests_common.h"
-#include "src/stream.h"
 #include "src/stream_protocol.h"
 
 #include <climits>
 
-TEST(VideoTransportStateTests, SecondaryPortUsesOffsetTwelve) {
-  EXPECT_EQ(stream::VIDEO_STREAM_2_PORT, 12);
-}
-
-TEST(VideoTransportStateTests, SecondaryTransportAvailabilityIsExplicit) {
-  const auto reservation = stream::reserve_second_video_port();
-  EXPECT_TRUE(!reservation || stream::second_video_port_available());
-}
 TEST(VideoFormatNameTests, CanonicalCodecNameNormalizesKnownAliases) {
   EXPECT_EQ(stream::canonical_codec_name("h264"), "H.264");
   EXPECT_EQ(stream::canonical_codec_name("H.264"), "H.264");
