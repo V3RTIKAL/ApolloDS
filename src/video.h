@@ -450,6 +450,14 @@ namespace video {
     void *channel_data
   );
 
+  /** Capture and encode a pinned secondary output into video_packets2. */
+  void capture_secondary(
+    safe::mail_t mail,
+    config_t config,
+    void *channel_data,
+    const std::string &output_name
+  );
+
   bool validate_encoder(
     encoder_t &encoder,
     bool expect_failure,

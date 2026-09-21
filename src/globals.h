@@ -52,11 +52,16 @@ namespace mail {
 
   // Local mail
   MAIL(touch_port);
+  MAIL(touch_port2);
   MAIL(idr);
+  MAIL(idr2);
   MAIL(invalidate_ref_frames);
+  MAIL(invalidate_ref_frames2);
   MAIL(gamepad_feedback);
   MAIL(hdr);
+  MAIL(hdr2);
   MAIL(dynamic_bitrate);  // Runtime encoder bitrate change (kbps), posted from the HTTP /bitrate handler
+  MAIL(dynamic_bitrate2);  // Secondary encoder bitrate updates remain isolated from the primary encoder.
 #undef MAIL
 
 }  // namespace mail

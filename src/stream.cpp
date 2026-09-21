@@ -589,6 +589,7 @@ namespace stream {
 
     video_stream_t video;
     video_stream_t video2;
+    std::atomic<secondary_stream_state_e> video2_state {secondary_stream_state_e::disabled};
 
     struct {
       crypto::cipher::cbc_t cipher;
@@ -1438,34 +1439,39 @@ namespace stream {
     server->map(packetTypes[IDX_REQUEST_IDR_FRAME], [&](session_t *session, const std::string_view &payload) {
       BOOST_LOG(debug) << "type [IDX_REQUEST_IDR_FRAME]"sv;
 
+      const auto index = parse_idr_stream_index(payload);
+      if (!index) {
+        BOOST_LOG(warning) << "Ignoring malformed indexed IDR request"sv;
+        return;
+      }
+      if (*index == 1 && !secondary_stream_accepts_control(session->video2_state.load(std::memory_order_acquire))) {
+        BOOST_LOG(warning) << "Ignoring IDR request for inactive secondary stream"sv;
+        return;
+      }
       saturating_add_relaxed(session->stats.idr_requests, 1u);
-      session->video.idr_events->raise(true);
+      (*index == 0 ? session->video : session->video2).idr_events->raise(true);
     });
 
     server->map(packetTypes[IDX_INVALIDATE_REF_FRAMES], [&](session_t *session, const std::string_view &payload) {
-      const auto first_frame = util::packet::read_i64_le(payload, 0);
-      const auto last_frame = util::packet::read_i64_le(payload, sizeof(std::int64_t));
-      if (!first_frame || !last_frame) {
-        BOOST_LOG(warning) << "Ignoring short IDX_INVALIDATE_REF_FRAMES payload (" << payload.size() << " bytes)";
+      const auto invalidation = parse_ref_frame_invalidation(payload);
+      if (!invalidation) {
+        BOOST_LOG(warning) << "Ignoring malformed reference-frame invalidation request"sv;
         return;
       }
-
-      const auto firstFrame = *first_frame;
-      const auto lastFrame = *last_frame;
-      if (firstFrame < 0 || lastFrame < 0 || lastFrame < firstFrame) {
-        BOOST_LOG(warning) << "Ignoring invalid IDX_INVALIDATE_REF_FRAMES payload first=" << firstFrame
-                           << " last=" << lastFrame;
+      if (invalidation->stream_index == 1 &&
+          !secondary_stream_accepts_control(session->video2_state.load(std::memory_order_acquire))) {
+        BOOST_LOG(warning) << "Ignoring reference-frame invalidation for inactive secondary stream"sv;
         return;
       }
 
       saturating_add_relaxed(session->stats.invalidate_ref_count, 1u);
-
       BOOST_LOG(debug)
         << "type [IDX_INVALIDATE_REF_FRAMES]"sv << std::endl
-        << "firstFrame [" << firstFrame << ']' << std::endl
-        << "lastFrame [" << lastFrame << ']';
+        << "firstFrame [" << invalidation->first_frame << ']' << std::endl
+        << "lastFrame [" << invalidation->last_frame << ']';
 
-      session->video.invalidate_ref_frames_events->raise(std::make_pair(firstFrame, lastFrame));
+      auto &video = invalidation->stream_index == 0 ? session->video : session->video2;
+      video.invalidate_ref_frames_events->raise(std::make_pair(invalidation->first_frame, invalidation->last_frame));
     });
 
     server->map(packetTypes[IDX_INPUT_DATA], [&](session_t *session, const std::string_view &payload) {
@@ -2698,11 +2704,17 @@ namespace stream {
 
   void videoThread2(session_t *session, std::string output_name) {
     platf::set_thread_name("session::video2");
+    session->video2_state.store(secondary_stream_state_e::connecting, std::memory_order_release);
+    auto finish = util::fail_guard([&]() {
+      session->video2_state.store(secondary_stream_state_e::ended, std::memory_order_release);
+      input::cancel_display_touches(session->input, 1);
+    });
     auto ref = broadcast.ref();
     if (recv_ping(session, ref, socket_e::video, session->video2.ping_payload, session->video2.peer, config::stream.ping_timeout) < 0) {
       BOOST_LOG(info) << "Secondary video did not connect; continuing primary-only"sv;
       return;
     }
+    session->video2_state.store(secondary_stream_state_e::running, std::memory_order_release);
     video::capture_secondary(session->mail, session->config.monitor2.value_or(session->config.monitor), session, output_name);
   }
 
@@ -3308,6 +3320,10 @@ namespace stream {
       session->undo_cmds = std::move(launch_session.client_undo_cmds);
 
       session->config = config;
+      session->video2_state.store(
+        config.monitor2 ? secondary_stream_state_e::negotiated : secondary_stream_state_e::disabled,
+        std::memory_order_relaxed
+      );
       session->stream_fps = session->config.monitor.framerate;
       session->stream_fps_scaled = session->config.monitor.encodingFramerate;
       if (launch_session.fps > 0) {
@@ -3342,6 +3358,7 @@ namespace stream {
       session->video.invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
       session->video.bitrate_events = mail->event<int>(mail::dynamic_bitrate);
       session->video.lowseq = 0;
+      session->video.gcm_iv_counter = 0;
       session->video.ping_payload = launch_session.av_ping_payload;
       if (config.encryptionFlagsEnabled & SS_ENC_VIDEO) {
         BOOST_LOG(info) << "Video encryption enabled"sv;
@@ -3349,7 +3366,19 @@ namespace stream {
           launch_session.gcm_key,
           false
         };
-        session->video.gcm_iv_counter = 0;
+      }
+
+      session->video2.idr_events = mail->event<bool>(mail::idr2);
+      session->video2.invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames2);
+      session->video2.bitrate_events = mail->event<int>(mail::dynamic_bitrate2);
+      session->video2.lowseq = 0;
+      session->video2.gcm_iv_counter = 0;
+      session->video2.ping_payload = launch_session.av_ping_payload;
+      if (config.encryptionFlagsEnabled & SS_ENC_VIDEO) {
+        session->video2.cipher = crypto::cipher::gcm_t {
+          launch_session.gcm_key,
+          false
+        };
       }
 
       constexpr auto max_block_size = crypto::cipher::round_to_pkcs7_padded(2048);

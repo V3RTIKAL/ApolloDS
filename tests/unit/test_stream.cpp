@@ -80,6 +80,56 @@ TEST(ControlPacketParsing, AllowsTypeOnlyPacketWithoutPayloadUnderflow) {
   EXPECT_TRUE(decoded->payload.empty());
 }
 
+TEST(IndexedControlParsing, IdrRequiresExactTwoBytePayload) {
+  const char primary[] = {'\0', '\0'};
+  const char secondary[] = {'\1', '\0'};
+  const char invalid_index[] = {'\2', '\0'};
+  const char invalid_reserved[] = {'\1', '\1'};
+  const char trailing[] = {'\1', '\0', '\0'};
+
+  EXPECT_EQ(stream::parse_idr_stream_index({primary, sizeof(primary)}), 0);
+  EXPECT_EQ(stream::parse_idr_stream_index({secondary, sizeof(secondary)}), 1);
+  EXPECT_FALSE(stream::parse_idr_stream_index({invalid_index, sizeof(invalid_index)}));
+  EXPECT_FALSE(stream::parse_idr_stream_index({invalid_reserved, sizeof(invalid_reserved)}));
+  EXPECT_FALSE(stream::parse_idr_stream_index({trailing, sizeof(trailing)}));
+  EXPECT_FALSE(stream::parse_idr_stream_index({}));
+}
+
+TEST(IndexedControlParsing, InvalidationRequiresExactTwentyFourBytePayload) {
+  const std::array<char, 24> secondary {{
+    '\x08', 0, 0, 0, 0, 0, 0, 0,
+    '\x0c', 0, 0, 0, 0, 0, 0, 0,
+    '\x01', 0, 0, 0, 0, 0, 0, 0,
+  }};
+  auto invalid_index = secondary;
+  invalid_index[16] = '\x02';
+
+  const auto parsed = stream::parse_ref_frame_invalidation({secondary.data(), secondary.size()});
+  ASSERT_TRUE(parsed);
+  EXPECT_EQ(parsed->first_frame, 8);
+  EXPECT_EQ(parsed->last_frame, 12);
+  EXPECT_EQ(parsed->stream_index, 1);
+  EXPECT_FALSE(stream::parse_ref_frame_invalidation({secondary.data(), secondary.size() - 1}));
+  EXPECT_FALSE(stream::parse_ref_frame_invalidation({invalid_index.data(), invalid_index.size()}));
+}
+
+TEST(IndexedControlParsing, SecondaryControlIsGatedByLifecycle) {
+  EXPECT_FALSE(stream::secondary_stream_accepts_control(stream::secondary_stream_state_e::disabled));
+  EXPECT_TRUE(stream::secondary_stream_accepts_control(stream::secondary_stream_state_e::negotiated));
+  EXPECT_TRUE(stream::secondary_stream_accepts_control(stream::secondary_stream_state_e::connecting));
+  EXPECT_TRUE(stream::secondary_stream_accepts_control(stream::secondary_stream_state_e::running));
+  EXPECT_FALSE(stream::secondary_stream_accepts_control(stream::secondary_stream_state_e::ended));
+}
+
+TEST(IndexedInputPolicy, ValidatesAndNamespacesTwoDisplays) {
+  EXPECT_EQ(stream::validate_display_index(0), 0);
+  EXPECT_EQ(stream::validate_display_index(1), 1);
+  EXPECT_FALSE(stream::validate_display_index(2));
+  EXPECT_EQ(stream::touch_pointer_id(7, 0), 7U);
+  EXPECT_EQ(stream::touch_pointer_id(7, 1), 0x80000007U);
+  EXPECT_NE(stream::touch_pointer_id(7, 0), stream::touch_pointer_id(7, 1));
+}
+
 TEST(StreamTargetParsing, PreservesLegacyTargetsAsStreamZero) {
   for (const auto target : {"video", "audio", "control", "rtsp://host/streamid=video"}) {
     const auto parsed = stream::parse_stream_target(target);

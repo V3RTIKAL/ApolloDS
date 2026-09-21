@@ -1544,6 +1544,7 @@ namespace video {
     safe::mail_raw_t::event_t<bool> shutdown_event;
     safe::mail_raw_t::queue_t<packet_t> packets;
     safe::mail_raw_t::event_t<bool> idr_events;
+    safe::mail_raw_t::event_t<std::pair<int64_t, int64_t>> invalidate_ref_frames_events;
     safe::mail_raw_t::event_t<hdr_info_t> hdr_events;
     safe::mail_raw_t::event_t<input::touch_port_t> touch_port_events;
     safe::mail_raw_t::event_t<int> bitrate_events;
@@ -1551,6 +1552,9 @@ namespace video {
     config_t config;
     int frame_nr;
     void *channel_data;
+    std::string output_name_override;
+    bool propagate_failure = true;
+    bool stop_requested = false;
     hdr_latch_t hdr_latch;
     // Last HDR info raised to this session's client, used to suppress duplicates on reinit.
     std::optional<hdr_info_raw_t> last_hdr_info;
@@ -5543,10 +5547,30 @@ namespace video {
       synced_session_ctxs.emplace_back(std::make_unique<sync_session_ctx_t>(std::move(*ctx)));
     }
 
+    const auto pinned_output = synced_session_ctxs.front()->output_name_override;
+    const auto pinned_open_deadline = std::chrono::steady_clock::now() + 5s;
     while (encode_session_ctx_queue.running()) {
+      if (synced_session_ctxs.front()->shutdown_event->peek() || synced_session_ctxs.front()->stop_requested) {
+        synced_session_ctxs.front()->join_event->raise(true);
+        return encode_e::ok;
+      }
 #ifdef _WIN32
       wait_for_recent_display_apply_stability();
 #endif
+      if (!pinned_output.empty()) {
+        if (std::chrono::steady_clock::now() >= pinned_open_deadline) {
+          BOOST_LOG(error) << "Timed out opening secondary output ["sv << pinned_output << ']';
+          synced_session_ctxs.front()->stop_requested = true;
+          synced_session_ctxs.front()->join_event->raise(true);
+          return encode_e::error;
+        }
+        reset_display(disp, encoder.platform_formats->dev_type, pinned_output, synced_session_ctxs.front()->config);
+        if (disp) {
+          break;
+        }
+        continue;
+      }
+
       // Refresh display names since a display removal might have caused the reinitialization
       refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
 
@@ -5612,7 +5636,7 @@ namespace video {
 
         KITTY_WHILE_LOOP(auto pos = std::begin(synced_sessions), pos != std::end(synced_sessions), {
           auto ctx = pos->ctx;
-          if (ctx->shutdown_event->peek()) {
+          if (ctx->shutdown_event->peek() || ctx->stop_requested) {
             // Let waiting thread know it can delete shutdown_event
             ctx->join_event->raise(true);
 
@@ -5631,6 +5655,11 @@ namespace video {
           if (ctx->idr_events->peek()) {
             pos->session->request_idr_frame();
             ctx->idr_events->pop();
+          }
+          while (ctx->invalidate_ref_frames_events->peek()) {
+            if (auto frames = ctx->invalidate_ref_frames_events->pop(0ms)) {
+              pos->session->invalidate_ref_frames(frames->first, frames->second);
+            }
           }
           if (ctx->bitrate_events->peek()) {
             // Coalesce rapid ABR updates to the latest requested value.
@@ -5672,7 +5701,11 @@ namespace video {
 
             if (pos->session->convert(*img)) {
               BOOST_LOG(error) << "Could not convert image"sv;
-              ctx->shutdown_event->raise(true);
+              if (ctx->propagate_failure) {
+                ctx->shutdown_event->raise(true);
+              } else {
+                ctx->stop_requested = true;
+              }
 
               continue;
             }
@@ -5706,7 +5739,11 @@ namespace video {
 
           if (encode(ctx->frame_nr++, *pos->session, ctx->packets, ctx->channel_data, frame_timestamp, capture_timestamp, host_processing_timestamp)) {
             BOOST_LOG(error) << "Could not encode video packet"sv;
-            ctx->shutdown_event->raise(true);
+            if (ctx->propagate_failure) {
+              ctx->shutdown_event->raise(true);
+            } else {
+              ctx->stop_requested = true;
+            }
 
             continue;
           }
@@ -5750,36 +5787,42 @@ namespace video {
     return encode_e::ok;
   }
 
-  void captureThreadSync() {
-    auto ref = capture_thread_sync.ref();
-
+  void captureThreadSyncFor(capture_thread_sync_ctx_t &ref, const char *thread_name) {
     std::vector<std::unique_ptr<sync_session_ctx_t>> synced_session_ctxs;
 
-    auto &ctx = ref->encode_session_ctx_queue;
+    auto &ctx = ref.encode_session_ctx_queue;
     auto lg = util::fail_guard([&]() {
       ctx.stop();
 
-      for (auto &ctx : synced_session_ctxs) {
-        ctx->shutdown_event->raise(true);
-        ctx->join_event->raise(true);
+      for (auto &session_ctx : synced_session_ctxs) {
+        if (session_ctx->propagate_failure) {
+          session_ctx->shutdown_event->raise(true);
+        }
+        session_ctx->join_event->raise(true);
       }
 
-      for (auto &ctx : ctx.unsafe()) {
-        ctx.shutdown_event->raise(true);
-        ctx.join_event->raise(true);
+      for (auto &session_ctx : ctx.unsafe()) {
+        if (session_ctx.propagate_failure) {
+          session_ctx.shutdown_event->raise(true);
+        }
+        session_ctx.join_event->raise(true);
       }
     });
 
-    // Encoding and capture take place on this thread. Late frames here turn into
-    // late hand-offs to the broadcast thread, producing the burst-then-idle pattern
-    // the send pacer is meant to absorb. Runs at critical (THREAD_PRIORITY_HIGHEST /
-    // nice -15, not a realtime class) — the same level the async capture thread uses.
-    platf::set_thread_name("video::capture_sync");
+    // Encoding and capture takes place on this thread.
+    platf::set_thread_name(thread_name);
     platf::adjust_thread_priority(platf::thread_priority_e::critical);
 
     std::vector<std::string> display_names;
     int display_p = -1;
     while (encode_run_sync(synced_session_ctxs, ctx, display_names, display_p) == encode_e::reinit) {}
+  }
+
+  void captureThreadSync() {
+    auto ref = capture_thread_sync.ref();
+    if (ref) {
+      captureThreadSyncFor(*ref.get(), "video::capture_sync");
+    }
   }
 
   void capture_async(
@@ -5998,21 +6041,57 @@ namespace video {
       safe::signal_t join_event;
       auto ref = capture_thread_sync.ref();
       ref->encode_session_ctx_queue.raise(sync_session_ctx_t {
-        &join_event,
-        mail->event<bool>(mail::shutdown),
-        mail::man->queue<packet_t>(mail::video_packets),
-        std::move(idr_events),
-        mail->event<hdr_info_t>(mail::hdr),
-        mail->event<input::touch_port_t>(mail::touch_port),
-        mail->event<int>(mail::dynamic_bitrate),
-        config,
-        1,
-        channel_data,
+        .join_event = &join_event,
+        .shutdown_event = mail->event<bool>(mail::shutdown),
+        .packets = mail::man->queue<packet_t>(mail::video_packets),
+        .idr_events = std::move(idr_events),
+        .invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames),
+        .hdr_events = mail->event<hdr_info_t>(mail::hdr),
+        .touch_port_events = mail->event<input::touch_port_t>(mail::touch_port),
+        .bitrate_events = mail->event<int>(mail::dynamic_bitrate),
+        .config = config,
+        .frame_nr = 1,
+        .channel_data = channel_data,
       });
 
       // Wait for join signal
       join_event.view();
     }
+  }
+
+  void capture_secondary(
+    safe::mail_t mail,
+    config_t config,
+    void *channel_data,
+    const std::string &output_name
+  ) {
+    auto idr_events = mail->event<bool>(mail::idr2);
+    idr_events->raise(true);
+
+    safe::signal_t join_event;
+    capture_thread_sync_ctx_t capture_context;
+    std::thread capture_thread {[&capture_context]() {
+      captureThreadSyncFor(capture_context, "video::capture_sync2");
+    }};
+    capture_context.encode_session_ctx_queue.raise(sync_session_ctx_t {
+      .join_event = &join_event,
+      .shutdown_event = mail->event<bool>(mail::shutdown),
+      .packets = mail::man->queue<packet_t>(mail::video_packets2),
+      .idr_events = std::move(idr_events),
+      .invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames2),
+      .hdr_events = mail->event<hdr_info_t>(mail::hdr2),
+      .touch_port_events = mail->event<input::touch_port_t>(mail::touch_port2),
+      .bitrate_events = mail->event<int>(mail::dynamic_bitrate2),
+      .config = config,
+      .frame_nr = 1,
+      .channel_data = channel_data,
+      .output_name_override = output_name,
+      .propagate_failure = false,
+    });
+
+    join_event.view();
+    capture_context.encode_session_ctx_queue.stop();
+    capture_thread.join();
   }
 
   enum validate_flag_e {

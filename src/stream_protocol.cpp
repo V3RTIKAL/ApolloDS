@@ -1,6 +1,9 @@
 #include "stream_protocol.h"
 
 #include <algorithm>
+#include <array>
+#include <bit>
+#include <cstring>
 #include <limits>
 
 namespace stream {
@@ -71,6 +74,48 @@ namespace stream {
     remaining -= primary_extra;
     secondary_budget += std::min(secondary_kbps - secondary_budget, remaining);
     return {primary_budget, secondary_budget};
+  }
+
+  std::optional<std::uint8_t> validate_display_index(std::uint16_t encoded_index) {
+    if (encoded_index > 1) {
+      return std::nullopt;
+    }
+    return static_cast<std::uint8_t>(encoded_index);
+  }
+
+  std::uint32_t touch_pointer_id(std::uint32_t pointer_id, std::uint8_t display_index) {
+    return pointer_id | (display_index == 0 ? 0U : 0x80000000U);
+  }
+
+  bool secondary_stream_accepts_control(secondary_stream_state_e state) {
+    return state == secondary_stream_state_e::negotiated ||
+           state == secondary_stream_state_e::connecting ||
+           state == secondary_stream_state_e::running;
+  }
+
+  std::optional<std::uint8_t> parse_idr_stream_index(std::string_view payload) {
+    if (payload.size() != 2 || payload[1] != 0) {
+      return std::nullopt;
+    }
+    return validate_display_index(static_cast<std::uint8_t>(payload[0]));
+  }
+
+  std::optional<ref_frame_invalidation_t> parse_ref_frame_invalidation(std::string_view payload) {
+    std::array<std::int64_t, 3> words {};
+    if (payload.size() != sizeof(words)) {
+      return std::nullopt;
+    }
+    std::memcpy(words.data(), payload.data(), sizeof(words));
+    if constexpr (std::endian::native == std::endian::big) {
+      for (auto &word : words) {
+        word = static_cast<std::int64_t>(std::byteswap(static_cast<std::uint64_t>(word)));
+      }
+    }
+    const auto index = words[2] < 0 || words[2] > 1 ? std::nullopt : validate_display_index(static_cast<std::uint16_t>(words[2]));
+    if (!index || words[0] < 0 || words[1] < words[0]) {
+      return std::nullopt;
+    }
+    return ref_frame_invalidation_t {words[0], words[1], *index};
   }
 
   std::optional<control_packet_view_t> decode_control_packet(std::string_view packet_bytes) {
