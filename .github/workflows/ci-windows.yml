@@ -291,11 +291,11 @@ jobs:
           # Derive the next patch alpha so both MSI ProductVersion and PE file
           # versions sort after the nearest merged release.
           if ([string]::IsNullOrWhiteSpace($buildVersion) -or $buildVersion -eq '0.0.0') {
-            $tag = (& git tag --merged HEAD --sort=-version:refname --list | Where-Object { $_ -match '^v?\d+\.\d+\.\d+(?:[-.].*)?$' } | Select-Object -First 1)
-            if ([string]::IsNullOrWhiteSpace($tag) -or $tag -notmatch '^v?(\d+)\.(\d+)\.(\d+)') {
-              throw 'Unable to derive an upgrade-safe validation version from a merged release tag.'
-            }
-            $buildVersion = '{0}.{1}.{2}-alpha.1' -f [int]$Matches[1], [int]$Matches[2], ([int]$Matches[3] + 1)
+            # This fork is based on Vibepollo 1.18.4. Give validation packages
+            # a strictly newer file/MSI version so upgrades cannot retain a
+            # stale 1.18.4 sunshine.exe. Keep this explicit: release tags are
+            # not guaranteed to be reachable in CI's commit checkout.
+            $buildVersion = '1.18.5-alpha.1'
           }
 
           if ($buildVersion -match '^v(.+)$') {
