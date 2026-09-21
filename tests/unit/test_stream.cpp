@@ -4,6 +4,7 @@
  */
 
 #include "../tests_common.h"
+#include "src/stream.h"
 #include "src/stream_protocol.h"
 
 #include <climits>
