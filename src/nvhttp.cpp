@@ -2775,7 +2775,7 @@ namespace nvhttp {
       tree.put("root.HttpsPort", net::map_port(PORT_HTTPS));
       tree.put("root.ExternalPort", net::map_port(PORT_HTTP));
       // H2 will raise this only after a second video socket can be reserved.
-      tree.put("root.MaxVideoStreams", 1);
+      tree.put("root.MaxVideoStreams", stream::second_video_port_available() ? 2 : 1);
 #ifdef _WIN32
       // Artemis checks /serverinfo before it offers virtual-display launches.
       // Publish the Windows capability and its current driver state for both

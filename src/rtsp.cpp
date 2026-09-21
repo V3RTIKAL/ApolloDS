@@ -1513,6 +1513,13 @@ namespace rtsp_stream {
       port = net::map_port(stream::AUDIO_STREAM_PORT);
     } else if (target->type == "video"sv && target->index == 0) {
       port = net::map_port(stream::VIDEO_STREAM_PORT);
+    } else if (target->type == "video"sv && target->index == 1) {
+      session->second_video_port_reservation = stream::reserve_second_video_port();
+      if (!session->second_video_port_reservation) {
+        cmd_not_found(server, socket, session, std::move(req));
+        return false;
+      }
+      port = net::map_port(stream::VIDEO_STREAM_2_PORT);
     } else if (target->type == "control"sv &&
                (target->index == 0 || target->index == 1 || target->index == 13)) {
       port = net::map_port(stream::CONTROL_PORT);

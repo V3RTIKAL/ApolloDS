@@ -50,9 +50,15 @@ namespace stream {
 
   struct session_t;
 
+  using port_reservation_t = std::shared_ptr<void>;
+  [[nodiscard]] port_reservation_t reserve_second_video_port();
+  [[nodiscard]] bool second_video_port_available();
+
   struct config_t {
     audio::config_t audio;
     video::config_t monitor;
+    std::optional<video::config_t> monitor2;
+    std::string secondary_output_name;
 
     int packetsize;
     int minRequiredFecPackets;

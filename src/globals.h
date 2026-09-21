@@ -46,6 +46,7 @@ namespace mail {
   MAIL(shutdown);
   MAIL(broadcast_shutdown);
   MAIL(video_packets);
+  MAIL(video_packets2);  ///< Independently queued packets for video stream 1.
   MAIL(audio_packets);
   MAIL(switch_display);
 

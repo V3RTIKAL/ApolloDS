@@ -57,6 +57,7 @@ namespace rtsp_stream {
     std::string client_uuid;
     std::string client_name;
     std::optional<std::string> hdr_profile;
+    std::shared_ptr<void> second_video_port_reservation;
     crypto::PERM perm;
     int appid;
 

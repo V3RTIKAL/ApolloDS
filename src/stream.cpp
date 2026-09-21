@@ -534,12 +534,14 @@ namespace stream {
 
     std::thread recv_thread;
     std::thread video_thread;
+    std::thread video_thread2;
     std::thread audio_thread;
     std::thread control_thread;
 
     asio::io_context io_context;
 
     udp::socket video_sock {io_context};
+    udp::socket video_sock2 {io_context};
     udp::socket audio_sock {io_context};
 
     control_server_t control_server;
@@ -561,6 +563,7 @@ namespace stream {
 
     std::thread audioThread;
     std::thread videoThread;
+    std::thread videoThread2;
 
     std::chrono::steady_clock::time_point pingTimeout;
 
@@ -568,7 +571,7 @@ namespace stream {
 
     boost::asio::ip::address localAddress;
 
-    struct {
+    struct video_stream_t {
       std::string ping_payload;
 
       int lowseq;
@@ -582,7 +585,10 @@ namespace stream {
       safe::mail_raw_t::event_t<int> bitrate_events;
 
       std::unique_ptr<platf::deinit_t> qos;
-    } video;
+    };
+
+    video_stream_t video;
+    video_stream_t video2;
 
     struct {
       crypto::cipher::cbc_t cipher;
@@ -723,6 +729,39 @@ namespace stream {
   void end_broadcast(broadcast_ctx_t &ctx);
 
   static auto broadcast = safe::make_shared<broadcast_ctx_t>(start_broadcast, end_broadcast);
+  std::atomic_bool video2_sender_ready {false};
+
+  struct broadcast_reservation_t {
+    decltype(broadcast)::ptr_t ref;
+  };
+
+  port_reservation_t reserve_second_video_port() {
+    auto ref = broadcast.ref();
+    if (!ref || !ref->video_sock2.is_open() || !video2_sender_ready.load(std::memory_order_acquire)) {
+      return {};
+    }
+    return std::make_shared<broadcast_reservation_t>(broadcast_reservation_t {std::move(ref)});
+  }
+
+  bool second_video_port_available() {
+    if (video2_sender_ready.load(std::memory_order_acquire)) {
+      return true;
+    }
+    const auto address_family = net::af_from_enum_string(config::sunshine.address_family);
+    boost::system::error_code error;
+    const auto bind_address = boost::asio::ip::make_address(net::get_bind_address(address_family), error);
+    if (error) {
+      return false;
+    }
+    asio::io_context io;
+    udp::socket probe {io};
+    probe.open(net::udp_protocol_for_address(bind_address), error);
+    if (error) {
+      return false;
+    }
+    probe.bind(udp::endpoint(bind_address, net::map_port(VIDEO_STREAM_2_PORT)), error);
+    return !error;
+  }
 
   void request_idr_for_all_sessions() {
     auto ref = broadcast.ref();
@@ -1870,9 +1909,9 @@ namespace stream {
     }
   }
 
-  void videoBroadcastThread(udp::socket &sock) {
+  void videoBroadcastThread(udp::socket &sock, std::string_view mail_id, session_t::video_stream_t session_t::*state) {
     auto shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
-    auto packets = mail::man->queue<video::packet_t>(mail::video_packets);
+    auto packets = mail::man->queue<video::packet_t>(mail_id);
     auto video_epoch = std::chrono::steady_clock::now();
 
     // Video traffic is sent on this thread. The send pacer (pacing_max_bitrate_kbps)
@@ -1927,7 +1966,7 @@ namespace stream {
         last_frame_timestamp = *packet->frame_timestamp;
       }
 
-      auto lowseq = session->video.lowseq;
+      auto lowseq = (session->*state).lowseq;
 
       std::string_view payload {(char *) packet->data(), packet->data_size()};
       std::vector<uint8_t> payload_with_replacements;
@@ -2113,10 +2152,10 @@ namespace stream {
 
           frame_fec_latency_logger.first_point_now();
           // If video encryption is enabled, we allocate space for the encryption header before each shard
-          auto shards = fec::encode(current_payload, blocksize, fecPercentage, session->config.minRequiredFecPackets, session->video.cipher ? sizeof(video_packet_enc_prefix_t) : 0);
+          auto shards = fec::encode(current_payload, blocksize, fecPercentage, session->config.minRequiredFecPackets, (session->*state).cipher ? sizeof(video_packet_enc_prefix_t) : 0);
           frame_fec_latency_logger.second_point_now_and_log();
 
-          auto peer_address = session->video.peer.address();
+          auto peer_address = (session->*state).peer.address();
           auto batch_info = platf::batched_send_info_t {
             shards.headers.begin(),
             shards.prefixsize,
@@ -2126,7 +2165,7 @@ namespace stream {
             0,
             (uintptr_t) sock.native_handle(),
             peer_address,
-            session->video.peer.port(),
+            (session->*state).peer.port(),
             session->localAddress,
           };
 
@@ -2160,7 +2199,7 @@ namespace stream {
             inspect->packet.frameIndex = (uint32_t) packet->frame_index();
 
             // Encrypt this shard if video encryption is enabled
-            if (session->video.cipher) {
+            if ((session->*state).cipher) {
               // We use the deterministic IV construction algorithm specified in NIST SP 800-38D
               // Section 8.2.1. The sequence number is our "invocation" field and the 'V' in the
               // high bytes is the "fixed" field. Because each client provides their own unique
@@ -2169,15 +2208,15 @@ namespace stream {
               //
               // The IV counter is 64 bits long which allows for 2^64 encrypted video packets
               // to be sent to each client before the IV repeats.
-              std::copy_n((uint8_t *) &session->video.gcm_iv_counter, sizeof(session->video.gcm_iv_counter), std::begin(iv));
+              std::copy_n((uint8_t *) &(session->*state).gcm_iv_counter, sizeof((session->*state).gcm_iv_counter), std::begin(iv));
               iv[11] = 'V';  // Video stream
-              session->video.gcm_iv_counter++;
+              (session->*state).gcm_iv_counter++;
 
               // Encrypt the target buffer in place
               auto *prefix = (video_packet_enc_prefix_t *) shards.prefix(x);
               prefix->frameNumber = (std::uint32_t) packet->frame_index();
               std::copy(std::begin(iv), std::end(iv), prefix->iv);
-              session->video.cipher->encrypt(std::string_view {(char *) inspect, (size_t) blocksize}, prefix->tag, (uint8_t *) inspect, &iv);
+              (session->*state).cipher->encrypt(std::string_view {(char *) inspect, (size_t) blocksize}, prefix->tag, (uint8_t *) inspect, &iv);
             }
 
             if (x - next_shard_to_send + 1 >= send_batch_size ||
@@ -2221,7 +2260,7 @@ namespace stream {
                     shards.blocksize,
                     (uintptr_t) sock.native_handle(),
                     peer_address,
-                    session->video.peer.port(),
+                    (session->*state).peer.port(),
                     session->localAddress,
                   };
 
@@ -2254,7 +2293,7 @@ namespace stream {
           lowseq += shards.size();
         });
 
-        session->video.lowseq = lowseq;
+        (session->*state).lowseq = lowseq;
 
         // Update per-session performance counters
         session->stats.frames_sent.fetch_add(1, std::memory_order_relaxed);
@@ -2388,8 +2427,10 @@ namespace stream {
     // Reset the packet queues which were stopped in end_broadcast.
     // If not reset, the broadcast threads will exit immediately when pop() returns null.
     auto video_packets = mail::man->queue<video::packet_t>(mail::video_packets);
+    auto video_packets2 = mail::man->queue<video::packet_t>(mail::video_packets2);
     auto audio_packets = mail::man->queue<audio::packet_t>(mail::audio_packets);
     video_packets->reset();
+    video_packets2->reset();
     audio_packets->reset();
 
     auto address_family = net::af_from_enum_string(config::sunshine.address_family);
@@ -2436,6 +2477,31 @@ namespace stream {
       return -1;
     }
 
+    /*
+     * The second display's socket.
+     *
+     * A failure here is logged and tolerated rather than fatal, unlike the first
+     * video socket above. The port may be taken by something else on a machine
+     * that has never used this feature, and refusing to stream at all because an
+     * optional second display could not be bound would break ordinary sessions
+     * for a capability the client probably never asked for. Left closed, the
+     * sender thread simply never sends, and RTSP still answers `video/1/0`
+     * because `dual_display::supported()` is about the display rather than the
+     * socket — a client that gets that far sees a stream that carries no frames
+     * and drops to one display, which is the same path a declining host takes.
+     */
+    auto video_port2 = net::map_port(VIDEO_STREAM_2_PORT);
+    ctx.video_sock2.open(protocol, ec);
+    if (ec) {
+      BOOST_LOG(warning) << "Couldn't open socket for the second display: "sv << ec.message();
+    } else {
+      ctx.video_sock2.bind(udp::endpoint(bind_addr, video_port2), ec);
+      if (ec) {
+        BOOST_LOG(warning) << "Couldn't bind the second display to port ["sv << video_port2
+                           << "]: "sv << ec.message();
+      }
+    }
+
     ctx.audio_sock.open(protocol, ec);
     if (ec) {
       BOOST_LOG(fatal) << "Couldn't open socket for Audio server: "sv << ec.message();
@@ -2456,7 +2522,11 @@ namespace stream {
     // After calling stop(), restart() must be called before run() will work again.
     ctx.io_context.restart();
 
-    ctx.video_thread = std::thread {videoBroadcastThread, std::ref(ctx.video_sock)};
+    ctx.video_thread = std::thread {videoBroadcastThread, std::ref(ctx.video_sock), mail::video_packets, &session_t::video};
+    if (ctx.video_sock2.is_open()) {
+      ctx.video_thread2 = std::thread {videoBroadcastThread, std::ref(ctx.video_sock2), mail::video_packets2, &session_t::video2};
+      video2_sender_ready.store(true, std::memory_order_release);
+    }
     ctx.audio_thread = std::thread {audioBroadcastThread, std::ref(ctx.audio_sock)};
     ctx.control_thread = std::thread {controlBroadcastThread, &ctx.control_server};
 
@@ -2469,18 +2539,22 @@ namespace stream {
     auto broadcast_shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
 
     broadcast_shutdown_event->raise(true);
+    video2_sender_ready.store(false, std::memory_order_release);
 
     auto video_packets = mail::man->queue<video::packet_t>(mail::video_packets);
+    auto video_packets2 = mail::man->queue<video::packet_t>(mail::video_packets2);
     auto audio_packets = mail::man->queue<audio::packet_t>(mail::audio_packets);
 
     // Minimize delay stopping video/audio threads
     video_packets->stop();
+    video_packets2->stop();
     audio_packets->stop();
 
     ctx.message_queue_queue->stop();
     ctx.io_context.stop();
 
     ctx.video_sock.close();
+    ctx.video_sock2.close();
     ctx.audio_sock.close();
 
     video_packets.reset();
@@ -2490,6 +2564,9 @@ namespace stream {
     ctx.recv_thread.join();
     BOOST_LOG(debug) << "Waiting for main video thread to end..."sv;
     ctx.video_thread.join();
+    if (ctx.video_thread2.joinable()) {
+      ctx.video_thread2.join();
+    }
     BOOST_LOG(debug) << "Waiting for main audio thread to end..."sv;
     ctx.audio_thread.join();
     BOOST_LOG(debug) << "Waiting for main control thread to end..."sv;
@@ -2617,6 +2694,16 @@ namespace stream {
 
     BOOST_LOG(debug) << "Start capturing Video"sv;
     video::capture(session->mail, session->config.monitor, session);
+  }
+
+  void videoThread2(session_t *session, std::string output_name) {
+    platf::set_thread_name("session::video2");
+    auto ref = broadcast.ref();
+    if (recv_ping(session, ref, socket_e::video, session->video2.ping_payload, session->video2.peer, config::stream.ping_timeout) < 0) {
+      BOOST_LOG(info) << "Secondary video did not connect; continuing primary-only"sv;
+      return;
+    }
+    video::capture_secondary(session->mail, session->config.monitor2.value_or(session->config.monitor), session, output_name);
   }
 
   void audioThread(session_t *session) {
@@ -2912,6 +2999,9 @@ namespace stream {
 
         BOOST_LOG(debug) << "Waiting for video to end..."sv;
         session.videoThread.join();
+        if (session.videoThread2.joinable()) {
+          session.videoThread2.join();
+        }
         hung_stage->store("audio thread");
         BOOST_LOG(debug) << "Waiting for audio to end..."sv;
         session.audioThread.join();
@@ -3066,6 +3156,9 @@ namespace stream {
 
       session.audioThread = std::thread {audioThread, &session};
       session.videoThread = std::thread {videoThread, &session};
+      if (session.config.monitor2 && !session.config.secondary_output_name.empty()) {
+        session.videoThread2 = std::thread {videoThread2, &session, session.config.secondary_output_name};
+      }
 
       session.state.store(state_e::RUNNING, std::memory_order_relaxed);
 
